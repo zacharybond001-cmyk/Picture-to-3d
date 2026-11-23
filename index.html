@@ -1112,6 +1112,11 @@ async function buildObject(img, P) {
   }
   if (tops.length) info.push(`Top/bottom: ${topW.toFixed(0)} mm wide`);
   if (fronts.length) info.push(`Front/back: ${frontW.toFixed(0)} mm wide`);
+  // sanity check: angled (3/4) photos or busy backgrounds give impossible widths
+  const warnW = (name, w) => { if (w > length * 0.9) info.push(`<span class="warn">The ${name} picture says the object is ${w.toFixed(0)} mm wide – wider than it is long. It's probably an angled photo or the cut-out caught the background. Use a straight-on view on a plain background.</span>`); };
+  if (tops.length) warnW("top/bottom", topW);
+  if (fronts.length) warnW("front/back", frontW);
+  if (topW && frontW && Math.abs(topW - frontW) / Math.min(topW, frontW) > 0.35) info.push(`<span class="warn">Top and front pictures disagree on width (${topW.toFixed(0)} vs ${frontW.toFixed(0)} mm) – one of them isn't straight-on.</span>`);
   // surface detail from each side's photo
   const hpOf = Lx => { const b = gaussBlur(Lx, W, H, 3), o = new Float32Array(W * H); for (let i = 0; i < W * H; i++) o[i] = Lx[i] - b[i]; return o; };
   const hpL = hpOf(L);
