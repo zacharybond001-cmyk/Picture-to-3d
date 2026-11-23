@@ -1,5 +1,5 @@
 // Picture to 3D - offline support. Bump VERSION when files change.
-const VERSION = "p3d-v2";
+const VERSION = "p3d-v3";
 const CORE = ["./", "index.html", "manifest.webmanifest", "vendor/three.module.js", "vendor/OrbitControls.js",
   "vendor/earcut.min.js", "vendor/clipper.js", "vendor/fflate.js",
   "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png", "icons/apple-touch-icon.png"];

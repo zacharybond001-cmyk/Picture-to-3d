@@ -44,7 +44,14 @@ main{display:grid;grid-template-columns:1fr 360px;height:calc(100% - 53px)}
 #hud .pill b{color:var(--text)}
 #thumb{position:absolute;right:10px;top:10px;width:190px;border:1px solid var(--line);border-radius:8px;background:#000;display:none;cursor:crosshair}
 #thumb:hover{border-color:var(--accent)}
-#tools{position:absolute;right:10px;bottom:10px;display:flex;gap:6px}
+#tools{position:absolute;right:10px;bottom:10px;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:calc(100% - 20px)}
+#orient{position:absolute;left:10px;bottom:10px;display:none;flex-direction:column;gap:6px;background:rgba(27,30,35,.92);border:1px solid var(--line);border-radius:10px;padding:8px;width:206px}
+#orient .r{display:flex;gap:5px}
+#orient button{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 4px;font:600 12px Inter,sans-serif;cursor:pointer}
+#orient button.on{border-color:var(--accent);color:var(--accent2)}
+#orient input{width:100%;accent-color:var(--accent)}
+#orient .t{font-size:11.5px;color:var(--dim)}
+#viewer.picking #view{cursor:crosshair}
 #tools button{background:rgba(27,30,35,.9);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font:600 12px Inter,sans-serif;cursor:pointer}
 #tools button.on{border-color:var(--accent);color:var(--accent2)}
 #busy{position:absolute;left:50%;top:12px;transform:translateX(-50%);background:var(--accent);color:#1a1006;font-weight:700;border-radius:20px;padding:4px 12px;font-size:12px;display:none}
@@ -96,8 +103,17 @@ details[open] summary::after{content:"–"}
     <div id="tools">
       <button id="bLit" title="Simulate light shining through">Backlit</button>
       <button id="bWire">Wire</button>
+      <button id="bOri">Orient</button>
       <button id="bFit">Fit</button>
       <button id="bNew">New picture</button>
+    </div>
+    <div id="orient">
+      <button id="oPick" title="Then tap the face that should sit on the bed">Pick bottom face</button>
+      <div class="r"><button data-ax="x">⟲ X 90°</button><button data-ax="y">⟲ Y 90°</button><button data-ax="z">⟲ Z 90°</button></div>
+      <div class="t">Spin on bed: <span id="oSpinV">0°</span></div>
+      <input type="range" id="oSpin" min="-180" max="180" step="5" value="0">
+      <div class="r"><button id="oStand" title="Stand a flat model up on its bottom edge">Stand up</button><button id="oReset">Reset</button></div>
+      <div class="t" id="oInfo">Lying flat (as built)</div>
     </div>
     <div id="drop" class="empty"><div class="card">
       <b>Drop a picture here</b>
@@ -1214,7 +1230,7 @@ const SCHEMA = [
   ]],
 ];
 const P = {mode: "litho", bgSeeds: []}, ROWS = {}, touched = new Set();
-let SRC = null, MODEL = null, VIEWING = false;
+let SRC = null, MODEL = null, RAW = null, VIEWING = false;
 
 // ----- build controls
 const tabs = document.getElementById("tabs");
@@ -1370,7 +1386,7 @@ for (const el of [drop, canvas]) {
 addEventListener("paste", e => { const f = [...(e.clipboardData?.files || [])][0]; f && f.type.startsWith("image") && loadFile(f); });
 async function loadFile(f) {
   if (/\.(stl|3mf)$/i.test(f.name)) return openModel(f);
-  VIEWING = false; document.getElementById("viewBanner").style.display = "none";
+  VIEWING = false; document.getElementById("viewBanner").style.display = "none"; resetOrient(false);
   SRC = await createImageBitmap(f); P.bgSeeds.length = 0;
   document.getElementById("fname").value = f.name.replace(/\.[^.]+$/, "").replace(/[^\w-]+/g, "_").slice(0, 40) || "model";
   drop.classList.remove("empty"); changed(true);
@@ -1408,7 +1424,7 @@ async function regen() {
   await new Promise(r => setTimeout(r, 30));
   try {
     const Q = params(false), t0 = performance.now();
-    MODEL = await Engine.buildModel(SRC, Q);
+    RAW = await Engine.buildModel(SRC, Q); MODEL = oriented(RAW);
     MODEL.preview = Q.res !== P.res;
     show(MODEL, needFit); needFit = false;
     drawThumb(MODEL.thumb, MODEL.alpha);
@@ -1454,16 +1470,78 @@ function renderInfo(m, ms) {
   document.getElementById("info").innerHTML = h;
 }
 
+// ----- orientation: which side sits on the bed (applied to preview and downloads)
+const ORIENT = new THREE.Quaternion(); let SPIN = 0, picking = false;
+function orientMatrix() {
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), SPIN * Math.PI / 180).multiply(ORIENT);
+  return new THREE.Matrix4().makeRotationFromQuaternion(q);
+}
+function oriented(model) {
+  if (!model) return model;
+  const M = orientMatrix(), e = M.elements, ident = ORIENT.equals(new THREE.Quaternion()) && SPIN === 0;
+  if (ident) return model;
+  const parts = model.parts.map(p => {
+    const P = p.mesh.pos, pos = new Float32Array(P.length);
+    for (let i = 0; i < P.length; i += 3) { const x = P[i], y = P[i + 1], z = P[i + 2];
+      pos[i] = e[0] * x + e[4] * y + e[8] * z; pos[i + 1] = e[1] * x + e[5] * y + e[9] * z; pos[i + 2] = e[2] * x + e[6] * y + e[10] * z; }
+    return {...p, mesh: {...p.mesh, pos}};
+  });
+  let lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+  for (const p of parts) for (let i = 0; i < p.mesh.pos.length; i += 3) for (let k = 0; k < 3; k++) { const v = p.mesh.pos[i + k]; if (v < lo[k]) lo[k] = v; if (v > hi[k]) hi[k] = v; }
+  const sh = [-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]];
+  for (const p of parts) for (let i = 0; i < p.mesh.pos.length; i += 3) for (let k = 0; k < 3; k++) p.mesh.pos[i + k] += sh[k];
+  return {...model, parts, size: [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]};
+}
+function orientChanged(refit = true) {
+  if (!RAW) return;
+  MODEL = oriented(RAW); show(MODEL, refit);
+  const ident = ORIENT.equals(new THREE.Quaternion()), d = new THREE.Vector3(0, 0, -1).applyQuaternion(ORIENT.clone().invert());
+  document.getElementById("oInfo").textContent = ident ? (SPIN ? "Flat, spun " + SPIN + "°" : "Lying flat (as built)")
+    : `Bottom = model's ${Math.abs(d.z) > .9 ? (d.z < 0 ? "underside" : "top") : Math.abs(d.y) > .9 ? (d.y < 0 ? "front edge" : "back edge") : Math.abs(d.x) > .9 ? (d.x < 0 ? "left edge" : "right edge") : "picked face"} · ${MODEL.size.map(v => v.toFixed(1)).join(" × ")} mm`;
+  if (!VIEWING) renderInfo(MODEL); else { const t = document.querySelector("#info table td + td"); if (t) t.textContent = MODEL.size.map(v => v.toFixed(1)).join(" × ") + " mm"; }
+}
+function resetOrient(update = true) { ORIENT.identity(); SPIN = 0; document.getElementById("oSpin").value = 0; document.getElementById("oSpinV").textContent = "0°"; if (update) orientChanged(); }
+const rot = (axis, deg) => { ORIENT.premultiply(new THREE.Quaternion().setFromAxisAngle(axis, deg * Math.PI / 180)); orientChanged(); };
+document.getElementById("bOri").onclick = e => { const o = document.getElementById("orient"), on = o.style.display !== "flex"; o.style.display = on ? "flex" : "none"; e.target.classList.toggle("on", on); if (!on) setPicking(false); };
+document.querySelectorAll("#orient [data-ax]").forEach(b => b.onclick = () => rot(new THREE.Vector3(...{x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1]}[b.dataset.ax]), 90));
+document.getElementById("oStand").onclick = () => rot(new THREE.Vector3(1, 0, 0), 90);
+document.getElementById("oReset").onclick = () => resetOrient();
+document.getElementById("oSpin").oninput = e => { SPIN = +e.target.value; document.getElementById("oSpinV").textContent = SPIN + "°"; orientChanged(false); };
+function setPicking(on) { picking = on; document.getElementById("oPick").classList.toggle("on", on); document.getElementById("viewer").classList.toggle("picking", on);
+  document.getElementById("oPick").textContent = on ? "Tap a face…" : "Pick bottom face"; }
+document.getElementById("oPick").onclick = () => setPicking(!picking);
+let downAt = null;
+canvas.addEventListener("pointerdown", e => downAt = [e.clientX, e.clientY]);
+canvas.addEventListener("pointerup", e => {
+  if (!picking || !downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6) return;
+  const r = canvas.getBoundingClientRect(), ray = new THREE.Raycaster();
+  ray.setFromCamera(new THREE.Vector2((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1), camera);
+  const hit = ray.intersectObjects(group.children, false)[0];
+  if (!hit || !hit.face) return;
+  let n = hit.face.normal.clone();
+  if (n.dot(ray.ray.direction) > 0) n.negate();          // the side you tapped
+  // n is in the displayed (spun) frame: fold spin into ORIENT, then lay that face down
+  ORIENT.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), SPIN * Math.PI / 180));
+  SPIN = 0; document.getElementById("oSpin").value = 0; document.getElementById("oSpinV").textContent = "0°";
+  // snap to the model's own square sides when the tapped face is within ~12° of one
+  const toModel = ORIENT.clone().invert(), nm = n.clone().normalize().applyQuaternion(toModel);
+  for (const ax of [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]]) {
+    const v = new THREE.Vector3(...ax); if (nm.dot(v) > Math.cos(12 * Math.PI / 180)) { n = v.applyQuaternion(ORIENT); break; }
+  }
+  ORIENT.premultiply(new THREE.Quaternion().setFromUnitVectors(n.normalize(), new THREE.Vector3(0, 0, -1)));
+  setPicking(false); orientChanged();
+});
+
 // ----- open finished models
 async function openModel(f) {
   document.getElementById("busy").style.display = "block"; drop.classList.remove("empty");
   await new Promise(r => setTimeout(r, 30));
   try {
     const m = Engine.readModel(await f.arrayBuffer(), f.name);
-    VIEWING = true; MODEL = m; backlit = false; document.getElementById("bLit").classList.remove("on"); scene.background.set(0x15171a);
-    show(m, true); drawThumb(null);
+    resetOrient(false); VIEWING = true; RAW = m; MODEL = oriented(m); backlit = false; document.getElementById("bLit").classList.remove("on"); scene.background.set(0x15171a);
+    show(MODEL, true); drawThumb(null);
     document.getElementById("viewBanner").style.display = "block";
-    document.getElementById("dl").disabled = true;
+    document.getElementById("dl").disabled = false; document.getElementById("fname").value = f.name.replace(/\.[^.]+$/, "").replace(/[^\w-]+/g, "_") + "_oriented";
     const tris = m.parts.reduce((s, p) => s + p.mesh.idx.length / 3, 0), cols = new Set(m.parts.map(p => p.color.toLowerCase()));
     let h = `<b style="color:var(--text)">${f.name}</b><table>`;
     h += `<tr><td>Size</td><td style="text-align:right;color:var(--text)">${m.size.map(v => v.toFixed(1)).join(" × ")} mm</td></tr>`;
@@ -1533,7 +1611,7 @@ document.getElementById("dl").onclick = async () => {
   const btn = document.getElementById("dl"); btn.disabled = true; msg("Building full-detail model…");
   await new Promise(r => setTimeout(r, 30));
   try {
-    const m = await Engine.buildModel(SRC, params(true)), fmt = document.getElementById("fmt").value;
+    const m = VIEWING ? MODEL : oriented(await Engine.buildModel(SRC, params(true))), fmt = document.getElementById("fmt").value;
     const name = (document.getElementById("fname").value || "model").replace(/[^\w-]+/g, "_"), files = {};
     if (fmt === "3mf" || fmt === "both") files[name + ".3mf"] = Engine.threeMF(m.parts);
     if (fmt === "stl" || fmt === "both") m.parts.forEach(p => files[`${name}_${p.name}.stl`] = Engine.stlBytes(p.mesh));
