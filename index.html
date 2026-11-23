@@ -416,7 +416,7 @@ function fixDiagonals(m, W, H, wrap) {
 }
 
 // closed solid over footprint: bottom z=0, top zfun(x,y); edges snapped to the true outline
-function heightfield(foot, zfun, px, wrapW, frameZone, frameH) {
+function heightfield(foot, zfun, px, wrapW, frameZone, frameH, zbot) {
   let [bx0, by0, bx1, by1] = G.bounds(foot);
   let W, sx, x0;
   if (wrapW) { W = Math.max(8, Math.round(wrapW / px)); sx = wrapW / W; x0 = 0; }
@@ -480,7 +480,7 @@ function heightfield(foot, zfun, px, wrapW, frameZone, frameH) {
     const r = Math.floor(v / VW), c = v % VW;
     let z = (fz && fz[r * VW + c]) ? frameH : zfun(VX[v], VY[v]);
     pos[3 * j] = pos[3 * (j + n)] = VX[v]; pos[3 * j + 1] = pos[3 * (j + n) + 1] = VY[v];
-    pos[3 * j + 2] = 0; pos[3 * (j + n) + 2] = z; thick[j] = thick[j + n] = z;
+    pos[3 * j + 2] = zbot ? zbot(VX[v], VY[v]) : 0; pos[3 * (j + n) + 2] = z; thick[j] = thick[j + n] = z;
   }
   const idx = new Uint32Array(cells.length / 4 * 12 + walls.length / 2 * 6); let o = 0;
   for (let k = 0; k < cells.length; k += 4) {
@@ -962,7 +962,12 @@ function removeBackground(img, P) {
 }
 
 async function buildModel(src, P) {
-  const img = rasterImage(src, P.form === "cylinder" && P.mode !== "extrude" && P.diameter ? Math.PI * P.diameter : P.width, P.res, P);
+  let wmm = P.form === "cylinder" && (P.mode === "litho" || P.mode === "relief") && P.diameter ? Math.PI * P.diameter : P.width;
+  if (P.mode === "object") {   // Width = the object's length, not the whole photo's
+    const q = rasterImage(src, 300, 1, P); removeBackground(q, P);
+    try { wmm = P.width * 300 / cutout(q, P.cutMethod, P).W; } catch (e) {}
+  }
+  const img = rasterImage(src, wmm, P.res, P);
   const bg = removeBackground(img, P);
   P.bgColor = bg && bg.color;
   let r;
@@ -973,6 +978,7 @@ async function buildModel(src, P) {
   } else if (P.mode === "extrude") r = await buildExtrude(img, P);
   else if (P.mode === "colors") r = await buildColors(img, P);
   else if (P.mode === "layers") r = await buildLayers(img, P);
+  else if (P.mode === "object") r = await buildObject(img, P);
   else r = await buildCutter(img, P);
   // centre on the bed and sit on z=0
   let lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
@@ -982,6 +988,188 @@ async function buildModel(src, P) {
   r.size = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
   r.alpha = img.A; r.bg = bg;
   return r;
+}
+
+// ---------- 3D object from pictures (side + optional top / front) ----------
+// cut the main object out of a picture: binary mask of the largest object, holes filled
+function cutout(img, method, P) {
+  const {W, H} = img, N = W * H, m = new Uint8Array(N);
+  if (method === "bg") {                     // use the background-removal settings (alpha)
+    for (let i = 0; i < N; i++) m[i] = img.A[i] >= 0.5;
+  } else {                                   // auto: darker or more colorful than the background
+    const L = luminance(img), sat = new Float32Array(N);
+    for (let i = 0; i < N; i++) sat[i] = Math.max(img.R[i], img.G[i], img.B[i]) - Math.min(img.R[i], img.G[i], img.B[i]);
+    // background = median of the border; object = clearly different from it
+    const b = []; for (let c = 0; c < W; c++) b.push(c, (H - 1) * W + c); for (let r = 0; r < H; r++) b.push(r * W, r * W + W - 1);
+    const bl = b.map(i => L[i]).sort((x, y) => x - y)[b.length >> 1], bs = b.map(i => sat[i]).sort((x, y) => x - y)[b.length >> 1];
+    const t = Math.max(0.06, (bl - otsu(L)) * 0.9 / (P.cutSens || 1));   // split where object and background separate
+    const dark = P.cutLight ? -1 : 1;   // objects are usually darker than a studio background
+    for (let i = 0; i < N; i++) m[i] = (img.A[i] >= 0.5) && (dark * (bl - L[i]) > t || sat[i] - bs > 0.16);
+  }
+  // break thin bridges (shadows, reflections) before picking the main piece
+  const rad = Math.max(1, Math.round(Math.min(W, H) / 150));
+  const erode = (src, k) => { const o = new Uint8Array(N); for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) { let ok = 1;
+      for (let dr = -k; dr <= k && ok; dr++) for (let dc = -k; dc <= k; dc++) { const rr = r + dr, cc = c + dc; if (rr < 0 || cc < 0 || rr >= H || cc >= W || !src[rr * W + cc]) { ok = 0; break; } }
+      o[r * W + c] = ok; } return o; };
+  const dilate = (src, k) => { const o = new Uint8Array(N); for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) { if (!src[r * W + c]) continue;
+      for (let dr = -k; dr <= k; dr++) for (let dc = -k; dc <= k; dc++) { const rr = r + dr, cc = c + dc; if (rr >= 0 && cc >= 0 && rr < H && cc < W) o[rr * W + cc] = 1; } } return o; };
+  const opened = dilate(erode(m, rad), rad);
+  // keep the largest connected piece
+  for (let i = 0; i < N; i++) m[i] = opened[i];
+  const lab = new Int32Array(N).fill(-1), q = new Int32Array(N); let best = -1, bestN = 0, id = 0;
+  for (let s = 0; s < N; s++) {
+    if (!m[s] || lab[s] >= 0) continue;
+    let h = 0, t = 0; q[t++] = s; lab[s] = id;
+    while (h < t) { const i = q[h++], r = (i / W) | 0, c = i - r * W;
+      for (const j of [c > 0 ? i - 1 : -1, c < W - 1 ? i + 1 : -1, r > 0 ? i - W : -1, r < H - 1 ? i + W : -1])
+        if (j >= 0 && m[j] && lab[j] < 0) { lab[j] = id; q[t++] = j; } }
+    if (t > bestN) { bestN = t; best = id; } id++;
+  }
+  for (let i = 0; i < N; i++) m[i] = lab[i] === best ? 1 : 0;
+  // fill holes: anything not reachable from the border through empty pixels
+  const out = new Uint8Array(N); let h = 0, t = 0;
+  const push = i => { if (!m[i] && !out[i]) { out[i] = 1; q[t++] = i; } };
+  for (let c = 0; c < W; c++) { push(c); push((H - 1) * W + c); } for (let r = 0; r < H; r++) { push(r * W); push(r * W + W - 1); }
+  while (h < t) { const i = q[h++], r = (i / W) | 0, c = i - r * W; if (c > 0) push(i - 1); if (c < W - 1) push(i + 1); if (r > 0) push(i - W); if (r < H - 1) push(i + W); }
+  for (let i = 0; i < N; i++) m[i] = out[i] ? 0 : 1;
+  // smooth the outline
+  const f = gaussBlur(Float32Array.from(m), W, H, 2);
+  for (let i = 0; i < N; i++) m[i] = f[i] > 0.5 ? 1 : 0;
+  // crop to the object
+  let r0 = H, r1 = -1, c0 = W, c1 = -1;
+  for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (m[r * W + c]) { if (r < r0) r0 = r; if (r > r1) r1 = r; if (c < c0) c0 = c; if (c > c1) c1 = c; }
+  if (r1 < 0) throw new Error("Couldn't find an object in the picture – try the other cut-out method.");
+  const cw = c1 - c0 + 1, ch = r1 - r0 + 1, mask = new Uint8Array(cw * ch), crop = k => { const o = new Float32Array(cw * ch); for (let r = 0; r < ch; r++) for (let c = 0; c < cw; c++) o[r * cw + c] = k[(r + r0) * W + c + c0]; return o; };
+  for (let r = 0; r < ch; r++) for (let c = 0; c < cw; c++) mask[r * cw + c] = m[(r + r0) * W + c + c0];
+  return {mask, W: cw, H: ch, L: crop(luminance(img)), R: crop(img.R), G: crop(img.G), B: crop(img.B)};
+}
+// ---------- multi-view carving ----------
+// view slots: the loaded picture is the LEFT side. Others are optional.
+//   right: other side (mirrored)  front/back: width × height   top/bottom: length × width
+function viewMask(bmp, P, mirrorX, mirrorY) {
+  const t = rasterImage(bmp, 100, 100 / Math.min(500, bmp.width), P);
+  if (P.cutMethod === "bg") removeBackground(t, {...P, bgSeeds: []});
+  const v = cutout(t, P.cutMethod, P);
+  return {...v, mx: !!mirrorX, my: !!mirrorY};
+}
+// sample a cropped view mask at normalised (u,v) in [0,1]
+const vAt = (v, u, w) => {
+  let c = Math.floor((v.mx ? 1 - u : u) * v.W), r = Math.floor((v.my ? 1 - w : w) * v.H);
+  c = Math.min(v.W - 1, Math.max(0, c)); r = Math.min(v.H - 1, Math.max(0, r));
+  return v.mask[r * v.W + c];
+};
+// span of a view along one axis at a given normalised position: [lo, hi] in 0..1 (or null)
+function vSpan(v, along, pos) {
+  const n = along === "col" ? v.H : v.W; let lo = -1, hi = -1;
+  for (let k = 0; k < n; k++) {
+    const val = along === "col" ? vAt(v, pos, (k + 0.5) / n) : vAt(v, (k + 0.5) / n, pos);
+    if (val) { if (lo < 0) lo = k; hi = k; }
+  }
+  return lo < 0 ? null : [lo / n, (hi + 1) / n];
+}
+async function buildObject(img, P) {
+  const side = cutout(img, P.cutMethod, P), {W, H, L} = side, px = img.px, V = P.views || {};
+  const mask = side.mask.slice(), length = W * px, height = H * px;
+  const info = [`Left side: ${length.toFixed(0)} × ${height.toFixed(0)} mm`], used = ["left side"];
+  // other side: same outline mirrored -> intersect (cleaner silhouette), and its own surface detail
+  let right = null;
+  if (V.right) {
+    right = viewMask(V.right, P, !P.flip_right, false);
+    const rv = rasterImage(V.right, 100, 100 / Math.min(500, V.right.width), P);
+    for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (!vAt(right, (c + 0.5) / W, (r + 0.5) / H)) mask[r * W + c] = 0;
+    used.push("right side");
+  }
+  // top/bottom give the footprint (length × width); front/back give the cross-section (width × height)
+  const tops = [], fronts = [];
+  if (V.top) tops.push(viewMask(V.top, P, P.flip_top, false));
+  if (V.bottom) tops.push(viewMask(V.bottom, P, P.flip_bottom, true));
+  if (V.front) fronts.push(viewMask(V.front, P, P.flip_front, false));
+  if (V.back) fronts.push(viewMask(V.back, P, !P.flip_back, false));
+  for (const k of ["top", "bottom", "front", "back"]) if (V[k]) used.push(k);
+  // real-world widths: top view scaled by length, front view scaled by height
+  const topW = tops.length ? tops[0].H * length / tops[0].W : 0, frontW = fronts.length ? fronts[0].W * height / fronts[0].H : 0;
+  const Wmm = topW && frontW ? Math.min(topW, frontW) : topW || frontW || P.objWidth / 100 * length;
+  // interval across the width (mm, 0 = centre line) for each column (from top) and each row (from front)
+  const colLo = new Float32Array(W), colHi = new Float32Array(W), rowLo = new Float32Array(H), rowHi = new Float32Array(H);
+  for (let c = 0; c < W; c++) {
+    const u = (c + 0.5) / W;
+    if (tops.length) {
+      let lo = 0, hi = 1, any = true;
+      for (const t of tops) { const sp = vSpan(t, "col", u); if (!sp) { any = false; break; } lo = Math.max(lo, sp[0]); hi = Math.min(hi, sp[1]); }
+      colLo[c] = any ? (lo - 0.5) * topW : 0; colHi[c] = any ? (hi - 0.5) * topW : 0;
+    } else {
+      const p = P.noseTaper, uu = Math.abs(u - 0.5) * 2, f = Math.max(0.3, Math.pow(1 - Math.pow(uu, p), 1 / p));
+      colLo[c] = -Wmm / 2 * f; colHi[c] = Wmm / 2 * f;
+    }
+  }
+  for (let r = 0; r < H; r++) {
+    const w = (r + 0.5) / H;
+    if (fronts.length) {
+      let lo = 0, hi = 1, any = true;
+      for (const f of fronts) { const sp = vSpan(f, "row", w); if (!sp) { any = false; break; } lo = Math.max(lo, sp[0]); hi = Math.min(hi, sp[1]); }
+      rowLo[r] = any ? (lo - 0.5) * frontW : 0; rowHi[r] = any ? (hi - 0.5) * frontW : 0;
+    } else { rowLo[r] = -1e9; rowHi[r] = 1e9; }
+  }
+  if (tops.length) info.push(`Top/bottom: ${topW.toFixed(0)} mm wide`);
+  if (fronts.length) info.push(`Front/back: ${frontW.toFixed(0)} mm wide`);
+  // surface detail from each side's photo
+  const hpOf = Lx => { const b = gaussBlur(Lx, W, H, 3), o = new Float32Array(W * H); for (let i = 0; i < W * H; i++) o[i] = Lx[i] - b[i]; return o; };
+  const hpL = hpOf(L);
+  let hpR = hpL;
+  if (right) {   // resample the right photo's brightness into the left frame
+    const rv = cutout(rasterImage(V.right, 100, 100 / Math.min(500, V.right.width), P), P.cutMethod, P), Lr = new Float32Array(W * H);
+    for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
+      let cc = Math.floor((P.flip_right ? (c + 0.5) / W : 1 - (c + 0.5) / W) * rv.W), rr = Math.floor((r + 0.5) / H * rv.H);
+      cc = Math.min(rv.W - 1, Math.max(0, cc)); rr = Math.min(rv.H - 1, Math.max(0, rr)); Lr[r * W + c] = rv.L[rr * rv.W + cc];
+    }
+    hpR = hpOf(Lr);
+  }
+  // per column: top surface row (for rounding the roofline when there's no front view)
+  const topRow = new Int32Array(W).fill(H), botRow = new Int32Array(W).fill(0);
+  for (let c = 0; c < W; c++) for (let r = 0; r < H; r++) if (mask[r * W + c]) { if (topRow[c] === H) topRow[c] = r; botRow[c] = r; }
+  const Rt = Math.max(0.5, P.roundTop / 100 * length), Rb = 0.02 * length, maxW = Math.max(...colHi.map((h, c) => h - colLo[c]));
+  const hiF = new Float32Array(W * H), loF = new Float32Array(W * H);
+  for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
+    const i = r * W + c; if (!mask[i]) continue;
+    let lo = Math.max(colLo[c], rowLo[r]), hi = Math.min(colHi[c], rowHi[r]);
+    const mid = (lo + hi) / 2;
+    let k = 1;
+    if (!fronts.length) {   // no front view: guess the cross-section
+      const dt = (r - topRow[c]) * px, db = (botRow[c] - r) * px, yrel = 1 - (r + 0.5) / H;
+      const rt = Math.sqrt(1 - Math.pow(1 - Math.min(1, Math.max(0, dt / Rt)), 2));
+      const rb = Math.max(0.55, Math.sqrt(1 - Math.pow(1 - Math.min(1, Math.max(0, db / Rb)), 2)));
+      k = Math.min(rt, rb) * (1 - P.cabin * Math.min(1, Math.max(0, (yrel - 0.58) / 0.42)));
+    } else if (P.roundTop > 0) {
+      const dt = (r - topRow[c]) * px; k = Math.sqrt(1 - Math.pow(1 - Math.min(1, Math.max(0, dt / Rt)), 2)) * 0.6 + 0.4;
+    }
+    lo = mid + (lo - mid) * k; hi = mid + (hi - mid) * k;
+    const fade = Math.min(1, Math.max(0, ((colHi[c] - colLo[c]) / maxW - 0.55) / 0.35)) * Math.min(1, (r - topRow[c]) * px / Rt);
+    hi += P.detail * Math.max(-0.2, Math.min(0.2, hpL[i])) * fade;
+    lo -= P.detail * Math.max(-0.2, Math.min(0.2, hpR[i])) * fade;
+    if (hi - lo < 2 * P.minHalf) { const m2 = (hi + lo) / 2; hi = m2 + P.minHalf; lo = m2 - P.minHalf; }
+    hiF[i] = hi; loF[i] = lo;
+  }
+  // extend values just outside the mask so edge samples stay sensible, then smooth
+  const grow = f => { const o = f.slice(); for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) { const i = r * W + c; if (mask[i]) continue;
+      let s = 0, n = 0; for (const j of [c > 0 ? i - 1 : -1, c < W - 1 ? i + 1 : -1, r > 0 ? i - W : -1, r < H - 1 ? i + W : -1]) if (j >= 0 && mask[j]) { s += f[j]; n++; }
+      if (n) o[i] = s / n; } return o; };
+  const hs = gaussBlur(grow(hiF), W, H, 1.0), ls = gaussBlur(grow(loF), W, H, 1.0);
+  const foot = trace(Float32Array.from(mask), W, H, 0.5, px, {smooth: 0.4});
+  const ex = G.ex(foot); if (!ex.length) throw new Error("No outline found – check the cut-out.");
+  ex.sort((a, b) => Math.abs(CL.Clipper.Area(b.outer)) - Math.abs(CL.Clipper.Area(a.outer)));
+  const outline = [ex[0].outer, ...ex[0].holes];
+  const sh = sampler(hs, W, H, px), sl = sampler(ls, W, H, px);
+  const top = (x, y) => { const a = sh(x, y), b = sl(x, y); return Math.max(a, (a + b) / 2 + P.minHalf); };
+  const bot = (x, y) => { const a = sh(x, y), b = sl(x, y); return Math.min(b, (a + b) / 2 - P.minHalf); };
+  const m = heightfield(outline, top, px, 0, null, 0, bot);
+  const Pp = m.pos; for (let i = 0; i < Pp.length; i += 3) { const y = Pp[i + 1], z = Pp[i + 2]; Pp[i + 1] = z; Pp[i + 2] = y; }  // stand it up
+  fixOrientation(m);
+  let n = 0, sr = 0, sg = 0, sb = 0; for (let i = 0; i < W * H; i++) if (mask[i]) { sr += side.R[i]; sg += side.G[i]; sb += side.B[i]; n++; }
+  const color = P.objAutoColor ? rgb2hex([sr / n, sg / n, sb / n]) : P.objColor;
+  const thumb = {W, H, rgba: i => mask[i] ? [side.R[i] * 255, side.G[i] * 255, side.B[i] * 255] : [40, 44, 50]};
+  info.push(`Pictures used: ${used.join(", ")}`);
+  if (!tops.length && !fronts.length) info.push("Tip: add a top and a front picture for the real shape");
+  return {parts: [{name: "object", mesh: m, color, smooth: true}], info, thumb};
 }
 
 // ---------- file writers ----------
@@ -1136,8 +1324,8 @@ window.Engine = {buildModel, stlBytes, threeMF, concat, G, readModel};
 import * as THREE from "three";
 import {OrbitControls} from "./vendor/OrbitControls.js";
 
-const MODES = [["litho", "Lithophane"], ["relief", "Relief"], ["extrude", "Logo / Sign"], ["colors", "Multicolor"], ["layers", "Layer colors"], ["cutter", "Cookie cutter"]];
-const RES = {litho: 0.2, relief: 0.2, extrude: 0.12, colors: 0.12, layers: 0.4, cutter: 0.12};
+const MODES = [["litho", "Lithophane"], ["relief", "Relief"], ["extrude", "Logo / Sign"], ["colors", "Multicolor"], ["layers", "Layer colors"], ["cutter", "Cookie cutter"], ["object", "3D object"]];
+const RES = {litho: 0.2, relief: 0.2, extrude: 0.12, colors: 0.12, layers: 0.4, cutter: 0.12, object: 0.25};
 const FONTS = ["Inter", "Oswald", "Bebas Neue", "Graduate", "Black Ops One", "Bungee", "Permanent Marker", "Pacifico", "Arial", "Georgia"];
 const HM = ["litho", "relief"], FLAT = ["extrude", "colors"];
 // control schema: [id, label, type, default, opts, modes]
@@ -1218,6 +1406,20 @@ const SCHEMA = [
     ["stamp", "Add stamp", "check", false, {}, ["cutter"]],
     ["stampDepth", "Stamp depth", "range", 3, {min: 1, max: 6, step: 0.5}, ["cutter"], P => P.stamp],
   ]],
+  ["3D object", [
+    ["objViews", "", "views", null, {}, ["object"]],
+    ["cutMethod", "Cut-out", "sel", "auto", {opts: [["auto", "Auto (object vs. background)"], ["bg", "Use Remove background"]]}, ["object"]],
+    ["cutSens", "Cut-out sensitivity", "range", 1, {min: 0.4, max: 2, step: 0.05}, ["object"], P => P.cutMethod === "auto"],
+    ["cutLight", "Object is lighter than background", "check", false, {}, ["object"], P => P.cutMethod === "auto"],
+    ["objWidth", "Width (% of length)", "range", 41, {min: 10, max: 100, step: 1}, ["object"], P => !P.views.top && !P.views.bottom && !P.views.front && !P.views.back],
+    ["noseTaper", "Ends shape", "range", 3, {min: 1.5, max: 10, step: 0.5, fmt: v => v < 2.5 ? "pointy" : v > 6 ? "boxy" : "rounded"}, ["object"], P => !P.views.top && !P.views.bottom],
+    ["cabin", "Upper taper", "range", 0.28, {min: 0, max: 0.7, step: 0.02}, ["object"], P => !P.views.front && !P.views.back],
+    ["roundTop", "Top rounding (%)", "range", 6, {min: 0, max: 20, step: 0.5}, ["object"]],
+    ["detail", "Photo detail (mm)", "range", 4.5, {min: 0, max: 12, step: 0.5}, ["object"]],
+    ["minHalf", "Thinnest (mm, half)", "range", 0.8, {min: 0.3, max: 3, step: 0.1}, ["object"]],
+    ["objAutoColor", "Color from photo", "check", true, {}, ["object"]],
+    ["objColor", "Model color", "color", "#8a94a6", {}, ["object"], P => !P.objAutoColor],
+  ]],
   ["Add-ons", [
     ["loop", "Keychain loop", "check", false, {}, [...HM, ...FLAT], P => !(HM.includes(P.mode) && P.form === "cylinder")],
     ["loopD", "Loop hole Ø", "range", 5, {min: 2, max: 10, step: 0.5}, [...HM, ...FLAT], P => P.loop],
@@ -1229,7 +1431,7 @@ const SCHEMA = [
     ["textGap", "Gap (mm)", "range", 3, {min: 0, max: 15, step: 0.5}, FLAT, P => P.text],
   ]],
 ];
-const P = {mode: "litho", bgSeeds: []}, ROWS = {}, touched = new Set();
+const P = {mode: "litho", bgSeeds: [], views: {}}, ROWS = {}, touched = new Set();
 let SRC = null, MODEL = null, RAW = null, VIEWING = false;
 
 // ----- build controls
@@ -1240,12 +1442,12 @@ for (const [id, label] of MODES) {
 }
 const ctl = document.getElementById("controls");
 for (const [gname, items] of SCHEMA) {
-  const d = document.createElement("details"); d.open = ["Size", "Picture", "Lithophane / relief", "Shape & plate", "Colors", "Layer colors", "Cookie cutter"].includes(gname);
+  const d = document.createElement("details"); d.open = ["Size", "Picture", "3D object", "Lithophane / relief", "Shape & plate", "Colors", "Layer colors", "Cookie cutter"].includes(gname);
   d.innerHTML = `<summary>${gname}</summary>`;
   const g = document.createElement("div"); g.className = "grp"; d.appendChild(g); ctl.appendChild(d);
   d._items = items;
   for (const [id, label, type, def, o = {}, modes, cond] of items) {
-    if (type !== "buttons") P[id] = def;
+    if (type !== "buttons" && type !== "views") P[id] = def;
     const row = document.createElement("div"); row.className = "row" + (type === "check" ? " check" : "");
     const lab = document.createElement("label"); lab.textContent = label; row.appendChild(lab);
     let inp, val;
@@ -1271,6 +1473,19 @@ for (const [gname, items] of SCHEMA) {
       inp = document.createElement("input"); inp.type = "color"; inp.value = def;
       inp.oninput = () => { P[id] = inp.value; changed(); };
       row.append(inp, document.createElement("span")); row._set = v => inp.value = v;
+    } else if (type === "views") {
+      row.className = "row check"; row.style.gridTemplateColumns = "1fr"; lab.remove();
+      const SL = {right: "Right side", front: "Front", back: "Back", top: "Top", bottom: "Bottom"};
+      const wrap = document.createElement("div"); wrap.innerHTML = `
+        <div class="note" style="margin:0 0 6px">Your loaded picture is the <b>left side</b>. Add up to 5 more pictures of the same object. Top + front matter most; the rest sharpen outlines and add detail to their side.</div>
+        ${Object.entries(SL).map(([k, t]) => `<div style="display:flex;gap:6px;align-items:center;margin:5px 0">
+          <canvas id="vt_${k}" width="56" height="36" style="width:56px;height:36px;border:1px solid var(--line);border-radius:6px;background:var(--bg);flex:none"></canvas>
+          <button class="btn ghost" id="vb_${k}" style="padding:5px 8px;flex:1;text-align:left">+ ${t}</button>
+          <label class="note" id="vm_${k}" style="display:none;gap:3px;align-items:center;margin:0" title="Tick if this picture faces the opposite way"><input type="checkbox" id="vfl_${k}">flip</label>
+          <button class="btn ghost" id="vx_${k}" style="padding:5px 8px;display:none" title="Remove">✕</button>
+          <input type="file" id="vf_${k}" accept="image/*" hidden></div>`).join("")}`;
+      row.append(wrap); g.appendChild(row);
+      ROWS[id] = {row, modes, cond, details: d}; continue;
     } else if (type === "buttons") {
       row.className = "row check"; lab.textContent = "";
       const box = document.createElement("div"); box.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center";
@@ -1317,7 +1532,7 @@ function setMode(m) {
   if (m === "colors" && !touched.has("base")) { P.base = 1.5; ROWS.base.row._set(1.5); }
   if (m === "extrude" && !touched.has("height")) { P.height = 2; ROWS.height.row._set(2); }
   if (m === "extrude" && !touched.has("base")) { P.base = 2; ROWS.base.row._set(2); }
-  document.getElementById("fmt").value = (m === "litho" || m === "relief" || m === "cutter") ? "stl1" : "3mf";
+  document.getElementById("fmt").value = (m === "litho" || m === "relief" || m === "cutter" || m === "object") ? "stl1" : "3mf";
   refreshVisibility(); changed(true);
 }
 
@@ -1388,6 +1603,7 @@ async function loadFile(f) {
   if (/\.(stl|3mf)$/i.test(f.name)) return openModel(f);
   VIEWING = false; document.getElementById("viewBanner").style.display = "none"; resetOrient(false);
   SRC = await createImageBitmap(f); P.bgSeeds.length = 0;
+  if (P.mode !== "object") { for (const k in P.views) delete P.views[k]; try { Object.keys(VSL).forEach(viewThumb); } catch (e) {} }
   document.getElementById("fname").value = f.name.replace(/\.[^.]+$/, "").replace(/[^\w-]+/g, "_").slice(0, 40) || "model";
   drop.classList.remove("empty"); changed(true);
 }
@@ -1414,6 +1630,7 @@ function params(final) {
     const w = P.form === "cylinder" ? Math.PI * P.diameter : P.width, h = w * (SRC.height / SRC.width);
     Q.res = Math.max(P.res, Math.sqrt(w * h / 110000));
   }
+  if (!final && P.mode === "object") { const w = P.width, h = w * SRC.height / SRC.width; Q.res = Math.max(P.res, Math.sqrt(w * h / 60000)); }
   if (!final && P.mode === "layers") { const w = P.width, h = w * SRC.height / SRC.width; Q.res = Math.max(P.res, Math.sqrt(w * h / 45000)); }
   return Q;
 }
@@ -1558,7 +1775,24 @@ async function openModel(f) {
 }
 
 // ----- presets & remembered settings
-const SKIP = new Set(["bgTools"]);
+const SKIP = new Set(["bgTools", "objViews"]);
+// extra view pictures for 3D object mode
+const VSL = {right: "Right side", front: "Front", back: "Back", top: "Top", bottom: "Bottom"};
+for (const k of Object.keys(VSL)) {
+  const fi = document.getElementById("vf_" + k);
+  document.getElementById("vb_" + k).onclick = () => fi.click();
+  fi.onchange = async () => { const f = fi.files[0]; if (!f) return; P.views[k] = await createImageBitmap(f); fi.value = ""; viewThumb(k); changed(true); };
+  document.getElementById("vx_" + k).onclick = () => { delete P.views[k]; viewThumb(k); changed(true); };
+  document.getElementById("vfl_" + k).onchange = e => { P["flip_" + k] = e.target.checked; changed(); };
+}
+function viewThumb(k) {
+  const c = document.getElementById("vt_" + k), x = c.getContext("2d"), b = P.views[k];
+  x.clearRect(0, 0, c.width, c.height);
+  if (b) { const sc = Math.min(c.width / b.width, c.height / b.height); x.drawImage(b, (c.width - b.width * sc) / 2, (c.height - b.height * sc) / 2, b.width * sc, b.height * sc); }
+  document.getElementById("vb_" + k).textContent = (b ? "✓ " : "+ ") + VSL[k];
+  document.getElementById("vx_" + k).style.display = b ? "" : "none";
+  document.getElementById("vm_" + k).style.display = b ? "flex" : "none";
+}
 const BUILTIN = {
   "★ Nighthawks 4-color sign": {mode: "colors", v: {width: 150, usePalette: true, pal1: "#000000", pal2: "#1ec8f0", pal3: "#ff2fa0", pal4: "#2a3fa8", pal4on: true, bgMode: "edges", plate: "outline", margin: 3, height: 1, base: 1.5}},
   "★ Keychain (logo)": {mode: "colors", v: {width: 50, bgMode: "edges", plate: "outline", margin: 2, height: 1, base: 2, loop: true, loopD: 4.5, minArea: 0.3}},
